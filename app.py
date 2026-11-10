@@ -1,14 +1,18 @@
 """제로음료 효과 '판정(분류)' — 모델 3종 + 베이스라인 시각 비교
 분류 대상: 지표 × 비교 칸마다  개선 / 불분명 / 악화  (모든 지표는 '낮을수록 개선'으로 가정)
-실행: pip install streamlit pandas numpy plotly scipy openpyxl  →  streamlit run app.py
+실행: pip install -r requirements.txt  →  streamlit run app.py
 """
+import io
+import unicodedata
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from scipy import optimize, stats
 
-EXCEL_FILE = "제로음료_임상시험_원자료_체중혈당.xlsx"
+APP_DIR = Path(__file__).resolve().parent
 METRIC_KO = {"Body Weight": "체중", "BMI": "BMI", "Body Fat": "체지방률", "Waist Circumference": "허리둘레",
              "HbA1c": "당화혈색소", "Fasting Blood Glucose": "공복혈당", "2-Hour Post-Prandial Glucose": "식후 2시간 혈당"}
 # edge: (Treatment1, Treatment2, 표시이름). 행의 MD = Treatment2 − Treatment1 (제로음료 비교는 MD<0 이면 제로음료가 더 낮음)
@@ -24,15 +28,26 @@ CONTRAST = {"A": np.array([1, 0]), "B": np.array([1, -1])}  # A: 제로−설탕
 
 
 # ───────────────────────── 데이터 ─────────────────────────
+def find_excel():
+    """저장소 안의 엑셀 파일을 이름과 무관하게 찾음 (파일명 변형·macOS 한글 자모 분리(NFD) 대비)"""
+    for files in (sorted(APP_DIR.glob("*.xlsx")), sorted(APP_DIR.rglob("*.xlsx")), sorted(Path.cwd().glob("*.xlsx"))):
+        files = [f for f in files if not f.name.startswith("~$") and ".venv" not in f.parts]
+        pref = [f for f in files if "제로음료" in unicodedata.normalize("NFC", f.name)]
+        if pref or files:
+            return (pref or files)[0]
+    return None
+
+
 @st.cache_data
-def load():
-    d = pd.read_excel(EXCEL_FILE, sheet_name="개별연구_원자료").dropna(subset=["지표"])
+def load(raw: bytes):
+    xl = pd.ExcelFile(io.BytesIO(raw))
+    d = xl.parse("개별연구_원자료").dropna(subset=["지표"])
     d = d.rename(columns={"연구(저자·연도)": "study", "Mean Difference": "y", "Standard Error": "se",
                           "Treatment 1": "t1", "Treatment 2": "t2"})
     d["metric"] = d["지표"].map(METRIC_KO)
     d["edge"] = [next(k for k, (a, b, _) in EDGES.items() if (a, b) == (x, z)) for x, z in zip(d.t1, d.t2)]
     d["paper"] = d["study"].str.replace(r"\s*\(.*\)", "", regex=True).str.strip()  # 같은 논문 = 같은 군집
-    s = pd.read_excel(EXCEL_FILE, sheet_name="종합분석_결과").dropna(subset=["지표"])
+    s = xl.parse("종합분석_결과").dropna(subset=["지표"])
     s["metric"], s["edge"] = s["지표"].map(METRIC_KO), s["비교"].map(PAPER_EDGE)
     return d[["metric", "단위", "study", "paper", "edge", "y", "se"]], s.dropna(subset=["edge"])
 
@@ -189,7 +204,16 @@ st.caption("각 (지표 × 비교) 칸을 **개선 / 불분명 / 악화** 3개 �
 st.warning("부호 가정: MD<0 이면 제로음료 쪽이 더 낮음(모든 지표 '낮을수록 개선'). 논문 합산값과 방향이 맞는 것은 확인했지만 원문 PDF로 재확인하세요. "
            "②는 같은 논문 행 사이 표본 공분산을, ③은 다중군 연구의 행 간 상관을 무시한 근사입니다.", icon="⚠️")
 
-d_all, s_all = load()
+path = find_excel()
+if path is not None:
+    raw = path.read_bytes()
+else:
+    st.error("엑셀 파일을 저장소에서 찾지 못했습니다. 아래에 직접 업로드하거나, 엑셀을 app.py와 같은 폴더에 올린 뒤 다시 배포하세요.")
+    up = st.file_uploader("엑셀 파일 업로드 (.xlsx)", type="xlsx")
+    if up is None:
+        st.stop()
+    raw = up.getvalue()
+d_all, s_all = load(raw)
 with st.sidebar:
     st.header("설정")
     sel = st.multiselect("분석할 지표", list(METRIC_KO.values()), default=list(METRIC_KO.values()))
