@@ -1,10 +1,9 @@
-"""제로음료 효과 '판정(분류)' — 모델 3종 + 베이스라인 시각 비교
+"""제로음료 효과 '판정(분류)' — 분류 모델 3종 + 메타분석 모델 시각 비교
+데이터는 이 파일 안에 내장되어 있어 엑셀 파일 없이 바로 실행됩니다.
 분류 대상: 지표 × 비교 칸마다  개선 / 불분명 / 악화  (모든 지표는 '낮을수록 개선'으로 가정)
 실행: pip install -r requirements.txt  →  streamlit run app.py
 """
 import io
-import unicodedata
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -20,7 +19,126 @@ from sklearn.model_selection import LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-APP_DIR = Path(__file__).resolve().parent
+# ───────────────────────── 내장 데이터 ─────────────────────────
+# 출처: 제로음료_임상시험_원자료_체중혈당.xlsx 의 '개별연구_원자료'(92행), '종합분석_결과'(21행) 시트를 CSV 텍스트로 옮긴 것
+STUDY_CSV = """표,지표,단위,연구(저자·연도),Treatment 1,Treatment 2,Mean Difference,Standard Error,원문 PDF 페이지,해석 주의
+eData 1,Body Weight,kg,Bonnet 2018,Water,LNCSB,-0.59,0.4,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Campos 2015,SSB,LNCSB,-2.3,5.45,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Ebbeling 2020,Water,LNCSB,-1.0,0.78,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Ebbeling 2020,SSB,LNCSB,-0.6,0.85,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Ebbeling 2020,SSB,Water,-0.5,0.78,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Engel 2018,Water,LNCSB,-0.2,6.52,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Engel 2018,SSB,LNCSB,-1.0,4.48,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Engel 2018,SSB,Water,-0.8,6.41,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Hernandez-Cordero 2014,SSB,Water,-0.4,0.57,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Higgins 2018 (1050mg ASP),Water,LNCSB,0.7,3.12,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Higgins 2018 (350mg ASP),Water,LNCSB,0.8,3.12,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Higgins 2019 (Asp),SSB,LNCSB,-1.12,0.8,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Higgins 2019 (RebA),SSB,LNCSB,-1.25,0.8,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Higgins 2019 (Sacrn),SSB,LNCSB,-0.67,0.8,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Higgins 2019 (Sucralose),SSB,LNCSB,-2.63,0.8,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Madjd 2015,Water,LNCSB,1.2,2.37,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Madjd 2017,Water,LNCSB,1.15,1.36,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Peters 2016,Water,LNCSB,-5.01,0.96,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Reid 2007,SSB,LNCSB,0.63,1.7,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Reid 2010,SSB,LNCSB,-0.32,1.13,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Reid 2014,SSB,LNCSB,-3.02,2.51,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Tate 2012,Water,LNCSB,-0.7,2.53,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Tordoff 1990 (Females),SSB,LNCSB,-0.72,0.21,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 1,Body Weight,kg,Tordoff 1990 (Males),SSB,LNCSB,-0.99,0.21,73,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Campos 2015,SSB,LNCSB,-0.9,1.88,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Engel 2018,Water,LNCSB,0.0,1.55,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Engel 2018,SSB,LNCSB,-0.3,1.3,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Engel 2018,SSB,Water,-0.3,1.33,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Hernandez-Cordero 2014,SSB,Water,-0.17,0.21,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Higgins 2019 (Asp),SSB,LNCSB,-0.4,0.27,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Higgins 2019 (RebA),SSB,LNCSB,-0.42,0.27,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Madjd 2015,Water,LNCSB,0.4,0.84,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Madjd 2017,Water,LNCSB,0.45,0.46,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Reid 2007,SSB,LNCSB,-0.3,0.49,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Reid 2010,SSB,LNCSB,-0.12,0.08,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 2,BMI,kg/m²,Reid 2014,SSB,LNCSB,-1.22,0.87,74,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Campos 2015,SSB,LNCSB,-2.0,3.07,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Ebbeling 2020,Water,LNCSB,1.27,3.35,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Ebbeling 2020,SSB,LNCSB,-1.57,3.45,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Ebbeling 2020,SSB,Water,-2.84,3.36,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Engel 2018,Water,LNCSB,0.05,8.0,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Engel 2018,SSB,LNCSB,-1.63,5.94,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Engel 2018,SSB,Water,-1.68,7.67,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Hernandez-Cordero 2014,SSB,Water,0.0,0.72,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Higgins 2018 (1050mg ASP),Water,LNCSB,-0.4,2.77,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Higgins 2018 (350mg ASP),Water,LNCSB,1.6,2.77,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Higgins 2019 (Asp),SSB,LNCSB,-0.51,0.44,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Higgins 2019 (RebA),SSB,LNCSB,-0.61,0.44,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Higgins 2019 (Sacrn),SSB,LNCSB,-0.58,0.44,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 3,Body Fat,%,Higgins 2019 (Sucralose),SSB,LNCSB,-0.74,0.44,75,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 4,Waist Circumference,cm,Bonnet 2018,Water,LNCSB,0.2,0.66,76,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 4,Waist Circumference,cm,Hernandez-Cordero 2014,SSB,Water,0.3,0.81,76,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 4,Waist Circumference,cm,Madjd 2015,Water,LNCSB,0.7,1.56,76,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 4,Waist Circumference,cm,Madjd 2017,Water,LNCSB,0.0,1.42,76,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 4,Waist Circumference,cm,Peters 2016,Water,LNCSB,-4.5,1.16,76,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 4,Waist Circumference,cm,Tate 2012,Water,LNCSB,-0.1,2.01,76,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 5,HbA1c,%,Hernandez-Cordero 2014,SSB,Water,-0.05,0.04,77,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 5,HbA1c,%,Higgins 2018 (1050mg ASP),Water,LNCSB,0.01,0.07,77,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 5,HbA1c,%,Higgins 2018 (350mg ASP),Water,LNCSB,0.03,0.07,77,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 5,HbA1c,%,Higgins 2019 (Asp),SSB,LNCSB,0.09,0.13,77,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 5,HbA1c,%,Higgins 2019 (RebA),SSB,LNCSB,0.12,0.13,77,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 5,HbA1c,%,Higgins 2019 (Sacrn),SSB,LNCSB,0.14,0.13,77,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 5,HbA1c,%,Madjd 2015,Water,LNCSB,0.2,0.11,77,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 5,HbA1c,%,Madjd 2017,Water,LNCSB,0.75,0.13,77,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Bonnet 2018,Water,LNCSB,-0.04,0.06,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Campos 2015,SSB,LNCSB,0.0,0.14,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Ebbeling 2020,Water,LNCSB,-0.05,0.06,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Ebbeling 2020,SSB,LNCSB,-0.05,0.06,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Ebbeling 2020,SSB,Water,0.0,0.06,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Engel 2018,Water,LNCSB,-0.12,0.21,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Engel 2018,SSB,LNCSB,-0.17,0.22,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Engel 2018,SSB,Water,-0.05,0.22,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Hernandez-Cordero 2014,SSB,Water,-0.03,0.18,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Higgins 2018 (1050mg ASP),Water,LNCSB,0.12,0.75,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Higgins 2018 (350mg ASP),Water,LNCSB,0.36,0.71,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Higgins 2019 (Asp),SSB,LNCSB,-0.34,0.3,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Higgins 2019 (RebA),SSB,LNCSB,-0.22,0.3,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Higgins 2019 (Sacrn),SSB,LNCSB,-0.6,0.3,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Higgins 2019 (Sucralose),SSB,LNCSB,-0.28,0.3,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Madjd 2015,Water,LNCSB,0.1,0.12,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Madjd 2017,Water,LNCSB,0.34,0.2,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Peters 2016,Water,LNCSB,-0.04,0.08,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 6,Fasting Blood Glucose,mmol/L,Tate 2012,Water,LNCSB,0.07,0.12,78,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Bonnet 2018,Water,LNCSB,0.12,0.16,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Higgins 2018 (1050mg ASP),Water,LNCSB,-0.18,0.61,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Higgins 2018 (350mg ASP),Water,LNCSB,-0.64,0.56,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Higgins 2019 (Asp),SSB,LNCSB,0.1,0.75,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Higgins 2019 (RebA),SSB,LNCSB,0.39,0.76,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Higgins 2019 (Sacrn),SSB,LNCSB,0.26,0.76,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Higgins 2019 (Sucralose),SSB,LNCSB,0.42,0.76,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Madjd 2015,Water,LNCSB,0.3,0.16,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+eData 7,2-Hour Post-Prandial Glucose,mmol/L,Madjd 2017,Water,LNCSB,0.31,0.24,79,Treatment 1과 Treatment 2의 순서를 유지. MD의 부호 해석은 논문 정의/비교 방향 확인 필요.
+"""
+SUMMARY_CSV = """지표,단위,비교,종합 평균차이(MD),95% CI 하한,95% CI 상한,p값,비교 수,근거 확실성(논문 GRADE 표기),원문 PDF 페이지
+Body Weight,kg,LNCSBs for SSBs,-1.057,-1.705,-0.408,0.001,24,Moderate,22
+Body Weight,kg,Water for SSBs,0.012,-0.952,0.976,0.981,24,Low,22
+Body Weight,kg,LNCSBs for Water,-1.069,-1.953,-0.185,0.018,24,Low,22
+BMI,kg/m²,LNCSBs for SSBs,-0.322,-0.575,-0.069,0.012,14,Low,23
+BMI,kg/m²,Water for SSBs,-0.347,-0.825,0.132,0.156,14,Low,23
+BMI,kg/m²,LNCSBs for Water,0.024,-0.462,0.51,0.922,14,Low,23
+Body Fat,%,LNCSBs for SSBs,-0.604,-1.031,-0.178,0.005,14,Moderate,24
+Body Fat,%,Water for SSBs,-0.267,-1.553,1.019,0.684,14,Low,24
+Body Fat,%,LNCSBs for Water,-0.337,-1.673,0.998,0.621,14,Low,24
+Waist Circumference,cm,LNCSBs for SSBs,-0.52,-4.981,3.941,0.819,6,Low,25
+Waist Circumference,cm,Water for SSBs,0.3,-3.681,4.281,0.883,6,Low,25
+Waist Circumference,cm,LNCSBs for Water,-0.82,-2.833,1.193,0.425,6,Low,25
+HbA1c,%,LNCSBs for SSBs,0.122,-0.079,0.324,0.234,9,Low,26
+HbA1c,%,Water for SSBs,-0.085,-0.327,0.156,0.489,9,Low,26
+HbA1c,%,LNCSBs for Water,0.208,0.016,0.4,0.034,9,Low,26
+Fasting Blood Glucose,mmol/L,LNCSBs for SSBs,-0.064,-0.155,0.026,0.162,19,Moderate,27
+Fasting Blood Glucose,mmol/L,Water for SSBs,-0.045,-0.137,0.048,0.348,19,Low,27
+Fasting Blood Glucose,mmol/L,LNCSBs for Water,-0.02,-0.084,0.044,0.545,19,Low,27
+2-Hour Post-Prandial Glucose,mmol/L,LNCSBs for SSBs,0.291,-0.451,1.034,0.442,9,Low,28
+2-Hour Post-Prandial Glucose,mmol/L,Water for SSBs,0.101,-0.666,0.869,0.796,9,Low,28
+2-Hour Post-Prandial Glucose,mmol/L,LNCSBs for Water,0.19,-0.005,0.385,0.056,9,Low,28
+"""
+
 METRIC_KO = {"Body Weight": "체중", "BMI": "BMI", "Body Fat": "체지방률", "Waist Circumference": "허리둘레",
              "HbA1c": "당화혈색소", "Fasting Blood Glucose": "공복혈당", "2-Hour Post-Prandial Glucose": "식후 2시간 혈당"}
 # edge: (Treatment1, Treatment2, 표시이름). 행의 MD = Treatment2 − Treatment1 (제로음료 비교는 MD<0 이면 제로음료가 더 낮음)
@@ -37,26 +155,21 @@ CONTRAST = {"A": np.array([1, 0]), "B": np.array([1, -1]), "C": np.array([0, 1])
 
 
 # ───────────────────────── 데이터 ─────────────────────────
-def find_excel():
-    """저장소 안의 엑셀 파일을 이름과 무관하게 찾음 (파일명 변형·macOS 한글 자모 분리(NFD) 대비)"""
-    for files in (sorted(APP_DIR.glob("*.xlsx")), sorted(APP_DIR.rglob("*.xlsx")), sorted(Path.cwd().glob("*.xlsx"))):
-        files = [f for f in files if not f.name.startswith("~$") and ".venv" not in f.parts]
-        pref = [f for f in files if "제로음료" in unicodedata.normalize("NFC", f.name)]
-        if pref or files:
-            return (pref or files)[0]
-    return None
-
-
 @st.cache_data
-def load(raw: bytes):
-    xl = pd.ExcelFile(io.BytesIO(raw))
-    d = xl.parse("개별연구_원자료").dropna(subset=["지표"])
+def load(raw: bytes | None = None):
+    """raw=None이면 내장 데이터, 엑셀 바이트가 오면 그 파일(같은 시트 구성)을 사용"""
+    if raw is None:
+        d0, s0 = pd.read_csv(io.StringIO(STUDY_CSV)), pd.read_csv(io.StringIO(SUMMARY_CSV))
+    else:
+        xl = pd.ExcelFile(io.BytesIO(raw))
+        d0, s0 = xl.parse("개별연구_원자료"), xl.parse("종합분석_결과")
+    d = d0.dropna(subset=["지표"])
     d = d.rename(columns={"연구(저자·연도)": "study", "Mean Difference": "y", "Standard Error": "se",
                           "Treatment 1": "t1", "Treatment 2": "t2"})
     d["metric"] = d["지표"].map(METRIC_KO)
     d["edge"] = [next(k for k, (a, b, _) in EDGES.items() if (a, b) == (x, z)) for x, z in zip(d.t1, d.t2)]
     d["paper"] = d["study"].str.replace(r"\s*\(.*\)", "", regex=True).str.strip()  # 같은 논문 = 같은 군집
-    s = xl.parse("종합분석_결과").dropna(subset=["지표"])
+    s = s0.dropna(subset=["지표"])
     s["metric"], s["edge"] = s["지표"].map(METRIC_KO), s["비교"].map(PAPER_EDGE)
     return d[["metric", "단위", "study", "paper", "edge", "y", "se"]], s.dropna(subset=["edge"])
 
@@ -380,16 +493,11 @@ st.caption("각 (지표 × 비교) 칸을 **개선 / 불분명 / 악화** 3개 �
 st.warning("부호 가정: MD<0 이면 제로음료 쪽이 더 낮음(모든 지표 '낮을수록 개선'). 논문 합산값과 방향이 맞는 것은 확인했지만 원문 PDF로 재확인하세요. "
            "②는 같은 논문 행 사이 표본 공분산을, ③은 다중군 연구의 행 간 상관을 무시한 근사입니다.", icon="⚠️")
 
-path = find_excel()
-if path is not None:
-    raw = path.read_bytes()
-else:
-    st.error("엑셀 파일을 저장소에서 찾지 못했습니다. 아래에 직접 업로드하거나, 엑셀을 app.py와 같은 폴더에 올린 뒤 다시 배포하세요.")
-    up = st.file_uploader("엑셀 파일 업로드 (.xlsx)", type="xlsx")
-    if up is None:
-        st.stop()
-    raw = up.getvalue()
-d_all, s_all = load(raw)
+with st.sidebar:
+    st.header("데이터")
+    up = st.file_uploader("다른 엑셀로 분석하기 (선택)", type="xlsx",
+                          help="비워 두면 내장 데이터를 씁니다. 같은 시트 구성('개별연구_원자료', '종합분석_결과')의 엑셀만 가능합니다.")
+d_all, s_all = load(up.getvalue() if up is not None else None)
 with st.sidebar:
     st.header("설정")
     sel = st.multiselect("분석할 지표", list(METRIC_KO.values()), default=list(METRIC_KO.values()))
