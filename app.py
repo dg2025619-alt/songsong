@@ -21,10 +21,11 @@ EDGES = {"A": ("SSB", "LNCSB", "제로음료 vs 설탕음료"), "B": ("Water", "
 PAPER_EDGE = {"LNCSBs for SSBs": "A", "LNCSBs for Water": "B"}
 MODELS = ["베이스라인(고정효과)", "① 랜덤효과+HK", "② 다수준+RVE", "③ 네트워크", "논문 보고값"]
 MCOLOR = ["#7F7F7F", "#4C78A8", "#F58518", "#54A24B", "#B279A2"]
+NAIVE = "다수결(기준선)"  # 항상 학습 데이터의 가장 흔한 클래스를 예측하는 무지성 분류기
 CLS, CODE = ["개선", "불분명", "악화"], {"개선": -1, "불분명": 0, "악화": 1}
 CCOLOR = {"개선": "#8FD18F", "불분명": "#E3E3E3", "악화": "#F4A6A6"}
 X_EDGE = {"A": [1, 0], "B": [1, -1], "C": [0, 1]}          # 기본 파라미터: d_L(제로−설탕), d_W(물−설탕)
-CONTRAST = {"A": np.array([1, 0]), "B": np.array([1, -1])}  # A: 제로−설탕, B: 제로−물
+CONTRAST = {"A": np.array([1, 0]), "B": np.array([1, -1]), "C": np.array([0, 1])}  # A: 제로−설탕, B: 제로−물
 
 
 # ───────────────────────── 데이터 ─────────────────────────
@@ -177,6 +178,100 @@ def drop_outliers(d, thr):
     return d[~d.index.isin(drop)].reset_index(drop=True)
 
 
+# ───────────────────────── 분류 성능 평가 (leave-one-paper-out) ─────────────────────────
+# 과제: 개별 연구 결과 1건이 개선/불분명/악화 중 무엇으로 관측될지 예측
+#  - 정답: 그 연구 자신의 95% CI (개선=CI가 0보다 아래, 악화=0보다 위, 그 외=불분명)
+#  - 예측: 같은 논문의 모든 행을 뺀 나머지 자료로 모델을 적합 → 예측분포 → 클래스 확률
+#  → 정답을 만든 연구가 학습에 들어가지 않으므로 순환(데이터 누수)이 없음
+def obs_class(y, se):
+    return "개선" if y + 1.96 * se < 0 else "악화" if y - 1.96 * se > 0 else "불분명"
+
+
+def _predict(model, tr_edge, tr_all, edge):
+    """(예측 평균, 관측오차를 제외한 예측 분산) 또는 None"""
+    try:
+        if model == MODELS[3]:
+            r = nma(tr_all, edge)
+            return None if r is None else (r["mu"], r.get("tau2", 0.0) + r["se"] ** 2)
+        if len(tr_edge) < 2:
+            return None
+        y, se = tr_edge.y.values, tr_edge.se.values
+        if model == MODELS[0]:
+            r = fe(y, se)
+            return r["mu"], r["se"] ** 2
+        if model == MODELS[1]:
+            r = re_hk(y, se)
+            return r["mu"], r.get("tau2", 0.0) + r["se"] ** 2
+        r = three_level(y, se, tr_edge.paper.values)
+        return r["mu"], r.get("tw", 0.0) + r.get("tb", 0.0) + r["se"] ** 2
+    except Exception:
+        return None
+
+
+DIRS = ["낮음(−)", "높음(+)"]
+TASKS = {"유의성 3클래스 (개선/불분명/악화)": CLS, "방향 2클래스 (제로음료 쪽이 낮음/높음)": DIRS}
+
+
+@st.cache_data
+def loo_eval(d):
+    """행마다 모델별 예측분포(평균 m, 분산 v = 모델 불확실성 + 그 연구의 관측오차)를 저장"""
+    rows = []
+    for m, gm in d.groupby("metric"):
+        for p in gm.paper.unique():
+            te, tr = gm[gm.paper == p], gm[gm.paper != p]
+            freq = pd.Series([obs_class(a, b) for a, b in zip(tr.y, tr.se)]).value_counts()
+            nv = np.array([freq.get(k, 0) + 1 for k in CLS], float)
+            nv /= nv.sum()  # 라플라스 평활
+            p_low = ((tr.y < 0).sum() + 1) / (len(tr) + 2)
+            for e in ("A", "B"):
+                t = te[te.edge == e]
+                if t.empty:
+                    continue
+                pred = {mod: _predict(mod, tr[tr.edge == e], tr, e) for mod in MODELS[:4]}
+                for _, r in t.iterrows():
+                    rec = dict(metric=m, edge=e, study=r.study, se=r.se, true_sig=obs_class(r.y, r.se),
+                               true_dir=DIRS[0] if r.y < 0 else DIRS[1], ns_low=p_low)
+                    for mod, pr in pred.items():
+                        rec[f"{mod}|m"], rec[f"{mod}|v"] = (pr[0], pr[1] + r.se**2) if pr else (np.nan, np.nan)
+                    for k, v in zip(CLS, nv):
+                        rec[f"ns|{k}"] = v
+                    rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def class_probs(ev, name, task):
+    """모델/기준선이 각 행에 주는 클래스 확률 (행 × 클래스)"""
+    if name == NAIVE:
+        return ev[[f"ns|{k}" for k in CLS]].values if task == "sig" else np.c_[ev["ns_low"], 1 - ev["ns_low"]]
+    m, sd, se = ev[f"{name}|m"].values, np.sqrt(ev[f"{name}|v"].values), ev["se"].values
+    if task == "dir":
+        pl = stats.norm.cdf(-m / sd)
+        return np.c_[pl, 1 - pl]
+    pb, pw = stats.norm.cdf((-1.96 * se - m) / sd), 1 - stats.norm.cdf((1.96 * se - m) / sd)
+    return np.c_[pb, np.clip(1 - pb - pw, 0, 1), pw]
+
+
+def score_models(ev, names, task):
+    """공통 행(모든 모델이 예측 가능)에서 정확도·macro-F1·log-loss·Brier 계산"""
+    classes, tcol = (CLS, "true_sig") if task == "sig" else (DIRS, "true_dir")
+    ok = ev.dropna(subset=[f"{n}|m" for n in names if n != NAIVE]).reset_index(drop=True)
+    Y = np.array([[t == k for k in classes] for t in ok[tcol]], float)
+    out, cms = [], {}
+    for n in names:
+        P = class_probs(ok, n, task)
+        pred = np.array(classes)[P.argmax(1)]
+        cm = pd.crosstab(pd.Categorical(ok[tcol], classes), pd.Categorical(pred, classes), dropna=False)
+        f1s = []
+        for k in classes:
+            if cm.loc[k].sum() > 0:
+                tp, fp, fn = cm.loc[k, k], cm[k].sum() - cm.loc[k, k], cm.loc[k].sum() - cm.loc[k, k]
+                f1s.append(2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else 0.0)
+        out.append({"모델": n, "정확도": (pred == ok[tcol].values).mean(), "macro-F1": np.mean(f1s),
+                    "log-loss": -(Y * np.log(np.clip(P, 1e-6, 1))).sum(1).mean(), "Brier": ((P - Y) ** 2).sum(1).mean()})
+        cms[n] = cm
+    return pd.DataFrame(out), cms, ok, classes, tcol
+
+
 @st.cache_data
 def run(d, s):
     cells = []
@@ -235,7 +330,77 @@ cells = run(d, s_all)
 for c in cells:
     c["cls"] = {k: classify(v, delta[c["metric"]]) for k, v in c["res"].items()}
 
-t1, t2, t3 = st.tabs(["① 판정표 한눈에", "② 칸별 자세히", "③ 진단(이질성·일치성)"])
+ev = loo_eval(d)
+NAMES = MODELS[:4] + [NAIVE]
+task_name = st.radio(
+    "분류 과제", list(TASKS), index=1, horizontal=True,
+    help="유의성: 연구 하나의 CI가 0을 넘는지(대부분 '불분명'이라 판별력이 낮음). 방향: 연구 하나의 효과가 0보다 낮은지 높은지.")
+task = "sig" if task_name.startswith("유의성") else "dir"
+ev_ok = ev.dropna(subset=[f"{n}|m" for n in MODELS[:4]]) if len(ev) else ev
+sc = pd.DataFrame()
+if len(ev_ok) >= 5:
+    sc, cms, ok, classes, tcol = score_models(ev, NAMES, task)
+
+if len(sc):  # 헤드라인: 분류 성능이 가장 좋은 모델의 판정
+    top = sc[sc["모델"].isin(MODELS[:4])].sort_values("log-loss").iloc[0]
+    best, nv = top["모델"], sc[sc["모델"] == NAIVE].iloc[0]
+    with st.container(border=True):
+        st.subheader(f"🏁 분류 성능 1위: {best}")
+        msg = f"{task_name} 기준 log-loss {top['log-loss']:.3f} (다수결 기준선 {nv['log-loss']:.3f}) — "
+        if top["log-loss"] < nv["log-loss"]:
+            st.success(msg + "기준선보다 잘 예측합니다.")
+        else:
+            st.warning(msg + "기준선을 넘지 못했습니다. 이 과제에서는 개별 연구 결과를 예측하는 데 모델이 거의 도움이 되지 않습니다 "
+                             "(개별 연구 대부분이 '불분명'이라 클래스가 한쪽으로 쏠려 있기 때문).")
+        st.caption(f"leave-one-paper-out 평가(공통 {len(ok)}건) 기준 1위 모델이 내린 칸별 최종 판정(합산 추정치의 95% CI 기준)입니다.")
+        icon = {"개선": "🟩 개선", "불분명": "⬜ 불분명", "악화": "🟥 악화", None: "—"}
+        piv = {}
+        for c in cells:
+            piv.setdefault(c["metric"], {})[c["comp"]] = icon[c["cls"][best]]
+        st.dataframe(pd.DataFrame(piv).T[[EDGES["A"][2], EDGES["B"][2]]].reindex(
+            [m for m in METRIC_KO.values() if m in piv]), width="stretch")
+
+tc, t1, t2, t3 = st.tabs(["⭐ 분류 성능", "① 판정표 한눈에", "② 칸별 자세히", "③ 진단(이질성·일치성)"])
+
+with tc:
+    st.subheader("분류 문제 정의")
+    if task == "sig":
+        st.markdown("**과제**: 연구 한 건이 **개선 / 불분명 / 악화** 중 무엇으로 관측될지 예측합니다. 정답은 그 연구 자신의 95% CI(0 기준)입니다.")
+    else:
+        st.markdown("**과제**: 연구 한 건의 효과가 0보다 **낮을지(제로음료 쪽이 더 낮음) / 높을지** 예측합니다. 정답은 그 연구 MD의 부호입니다.")
+    st.markdown("**예측**: 같은 논문을 통째로 뺀 나머지 자료로 모델을 적합해 클래스 확률을 계산합니다(leave-one-paper-out). "
+                "정답을 만든 연구가 학습에 들어가지 않아 순환 평가가 아닙니다.  \n"
+                f"**기준선**: '{NAIVE}'은 학습 데이터에서 가장 흔한 클래스만 찍는 분류기로, 모델이 이보다 나아야 의미가 있습니다.")
+    if sc.empty:
+        st.info("평가할 데이터가 부족합니다.")
+    else:
+        n_true = ok[tcol].value_counts().reindex(classes, fill_value=0)
+        st.caption(f"평가 대상 {len(ok)}건 · 실제 클래스 분포: " + " / ".join(f"{k} {n_true[k]}" for k in classes))
+        st.dataframe(sc.set_index("모델").style.format({"정확도": "{:.1%}", "macro-F1": "{:.2f}", "log-loss": "{:.3f}", "Brier": "{:.3f}"})
+                     .highlight_max(subset=["정확도", "macro-F1"], color="#cde8cd")
+                     .highlight_min(subset=["log-loss", "Brier"], color="#cde8cd"), width="stretch")
+        st.caption("정확도·macro-F1은 높을수록, log-loss·Brier는 낮을수록 좋습니다. 클래스가 한쪽으로 쏠리면 정확도만으로는 기준선과 구분이 안 되므로 log-loss, Brier를 함께 보세요.")
+        b1, b2 = st.columns(2)
+        for col, key, ttl in [(b1, "정확도", "정확도 (높을수록 좋음)"), (b2, "log-loss", "log-loss (낮을수록 좋음)")]:
+            f = go.Figure(go.Bar(x=sc["모델"], y=sc[key], marker_color=MCOLOR[:4] + ["#CCCCCC"],
+                                 text=[f"{v:.2f}" for v in sc[key]], textposition="outside"))
+            f.update_layout(title=ttl, height=340, margin=dict(l=10, r=10, t=50, b=10), xaxis_tickangle=-20)
+            col.plotly_chart(f, width="stretch")
+        st.subheader("혼동행렬 (행=실제, 열=예측)")
+        for col, n in zip(st.columns(len(NAMES)), NAMES):
+            cm = cms[n]
+            f = go.Figure(go.Heatmap(z=cm.values, x=classes, y=classes, text=cm.values, texttemplate="%{text}", showscale=False,
+                                     colorscale="Blues", xgap=2, ygap=2))
+            f.update_yaxes(autorange="reversed")
+            f.update_layout(title=dict(text=n, font=dict(size=12)), height=300, margin=dict(l=10, r=10, t=50, b=10))
+            col.plotly_chart(f, width="stretch")
+        st.subheader("가장 크게 빗나간 연구")
+        bp = class_probs(ok, best, task)
+        ok2 = ok.assign(예측=np.array(classes)[bp.argmax(1)], 정답확률=[bp[i, classes.index(t)] for i, t in enumerate(ok[tcol])])
+        miss = ok2[ok2["예측"] != ok2[tcol]].sort_values("정답확률").head(10)
+        st.dataframe(miss[["metric", "study", tcol, "예측", "정답확률"]].rename(columns={"metric": "지표", "study": "연구", tcol: "실제"})
+                     .assign(정답확률=lambda x: x["정답확률"].map("{:.1%}".format)), hide_index=True, width="stretch")
+        st.caption(f"{best}가 틀린 연구 중 정답 클래스에 가장 낮은 확률을 준 사례입니다. 이상치(예: Peters 2016, Madjd 2017)가 여기에 나타나는지 확인해 보세요.")
 
 with t1:
     ylab = [f"{c['metric']} · {c['comp']}" for c in cells]
