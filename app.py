@@ -11,6 +11,14 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from scipy import optimize, stats
+from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (balanced_accuracy_score, confusion_matrix, f1_score, log_loss, roc_auc_score, roc_curve)
+from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 APP_DIR = Path(__file__).resolve().parent
 METRIC_KO = {"Body Weight": "체중", "BMI": "BMI", "Body Fat": "체지방률", "Waist Circumference": "허리둘레",
@@ -272,6 +280,79 @@ def score_models(ev, names, task):
     return pd.DataFrame(out), cms, ok, classes, tcol
 
 
+# ───────────────────────── 분류 모델 3종 (지도학습) ─────────────────────────
+# 입력(특징): 지표, 비교, 하위군(감미료·성별 등), 발표연도, 지표 안에서 표준화한 SE 크기  ← 효과크기(MD)는 넣지 않음(정답 누수 방지)
+# 출력(클래스): 방향(낮음/높음) 또는 유의성(개선/불분명/악화)
+# 평가: leave-one-paper-out (같은 논문 행은 통째로 검증용으로 빼서 예측)
+CLF_NAMES = ["로지스틱 회귀", "랜덤 포레스트", "그래디언트 부스팅"]
+CF_COLOR = ["#4C78A8", "#54A24B", "#E45756", "#BBBBBB"]
+CAT, NUM = ["metric", "edge", "sub"], ["year", "log_se_z"]
+
+
+def make_features(d):
+    x = d[d.edge.isin(["A", "B"])].reset_index(drop=True).copy()  # 제로음료가 들어간 비교만
+    x["year"] = pd.to_numeric(x.study.str.extract(r"(\d{4})")[0], errors="coerce")
+    x["year"] = x["year"].fillna(x["year"].median())
+    sub = x.study.str.extract(r"\((.*?)\)")[0].fillna("없음")
+    x["sub"] = sub.where(sub.map(sub.value_counts()) >= 3, "기타")
+    ls = np.log(x.se)
+    x["log_se_z"] = ls.groupby(x.metric).transform(lambda v: (v - v.mean()) / (v.std(ddof=0) or 1.0))
+    x["true_sig"] = [obs_class(a, b) for a, b in zip(x.y, x.se)]
+    x["true_dir"] = np.where(x.y < 0, DIRS[0], DIRS[1])
+    return x
+
+
+def clf_pipe(name):
+    pre = ColumnTransformer([("c", OneHotEncoder(handle_unknown="ignore", sparse_output=False), CAT), ("n", StandardScaler(), NUM)])
+    est = {CLF_NAMES[0]: LogisticRegression(C=1.0, class_weight="balanced", max_iter=2000),
+           CLF_NAMES[1]: RandomForestClassifier(n_estimators=200, min_samples_leaf=2, class_weight="balanced_subsample", random_state=0),
+           CLF_NAMES[2]: GradientBoostingClassifier(n_estimators=100, max_depth=2, learning_rate=0.05, subsample=0.8, random_state=0),
+           NAIVE: DummyClassifier(strategy="prior")}[name]
+    return Pipeline([("pre", pre), ("clf", est)])
+
+
+def _clean(n):
+    for a, b in [("c__metric_", "지표="), ("c__edge_A", "비교=제로 vs 설탕"), ("c__edge_B", "비교=제로 vs 물"), ("c__sub_", "하위군="),
+                 ("n__year", "발표연도"), ("n__log_se_z", "SE 크기(정밀도)")]:
+        n = n.replace(a, b)
+    return n
+
+
+@st.cache_data
+def run_classifiers(x, task):
+    classes, tcol = (CLS, "true_sig") if task == "sig" else (DIRS, "true_dir")
+    y, K, names = np.array([classes.index(v) for v in x[tcol]]), len(classes), CLF_NAMES + [NAIVE]
+    F, oof = x[CAT + NUM], {n: np.zeros((len(x), len(classes))) for n in names}
+    for tr, te in LeaveOneGroupOut().split(F, y, groups=x.paper):
+        for n in names:
+            if len(np.unique(y[tr])) < 2:  # 학습에 클래스가 하나뿐이면 사전확률로 대체
+                pr = np.bincount(y[tr], minlength=K) + 1.0
+                oof[n][te] = pr / pr.sum()
+                continue
+            m = clf_pipe(n).fit(F.iloc[tr], y[tr])
+            full = np.zeros((len(te), K))
+            full[:, m.classes_] = m.predict_proba(F.iloc[te])
+            oof[n][te] = 0.98 * full + 0.02 / K  # 0확률 방지용 약한 평활(모든 모델 동일)
+    Y, rows, cms = np.eye(K)[y], [], {}
+    for n, P in oof.items():
+        pred = P.argmax(1)
+        try:
+            auc = roc_auc_score(y == 0, P[:, 0]) if K == 2 else roc_auc_score(Y, P, average="macro")
+        except ValueError:
+            auc = np.nan
+        rows.append({"모델": n, "정확도": (pred == y).mean(), "균형정확도": balanced_accuracy_score(y, pred),
+                     "macro-F1": f1_score(y, pred, average="macro", labels=np.unique(y), zero_division=0), "AUC": auc,
+                     "log-loss": log_loss(y, P, labels=list(range(K))), "Brier": ((P - Y) ** 2).sum(1).mean()})
+        cms[n] = confusion_matrix(y, pred, labels=list(range(K)))
+    fitted = {n: clf_pipe(n).fit(F, y) for n in CLF_NAMES}  # 전체 자료로 적합(중요도·직접 예측용)
+    imps = {}
+    for n, m in fitted.items():
+        est, names_f = m.named_steps["clf"], [_clean(f) for f in m.named_steps["pre"].get_feature_names_out()]
+        v = np.abs(est.coef_).mean(0) if n == CLF_NAMES[0] else est.feature_importances_
+        imps[n] = pd.Series(v / v.sum(), index=names_f).sort_values(ascending=False)
+    return dict(scores=pd.DataFrame(rows), cms=cms, oof=oof, y=y, classes=classes, tcol=tcol, fitted=fitted, imps=imps)
+
+
 @st.cache_data
 def run(d, s):
     cells = []
@@ -330,40 +411,135 @@ cells = run(d, s_all)
 for c in cells:
     c["cls"] = {k: classify(v, delta[c["metric"]]) for k, v in c["res"].items()}
 
-ev = loo_eval(d)
-NAMES = MODELS[:4] + [NAIVE]
 task_name = st.radio(
     "분류 과제", list(TASKS), index=1, horizontal=True,
-    help="유의성: 연구 하나의 CI가 0을 넘는지(대부분 '불분명'이라 판별력이 낮음). 방향: 연구 하나의 효과가 0보다 낮은지 높은지.")
+    help="방향: 연구 결과가 0보다 낮은지 높은지(기본). 유의성: 연구 하나의 CI가 0을 넘는지(대부분 '불분명'이라 클래스가 쏠림).")
 task = "sig" if task_name.startswith("유의성") else "dir"
-ev_ok = ev.dropna(subset=[f"{n}|m" for n in MODELS[:4]]) if len(ev) else ev
-sc = pd.DataFrame()
-if len(ev_ok) >= 5:
-    sc, cms, ok, classes, tcol = score_models(ev, NAMES, task)
 
-if len(sc):  # 헤드라인: 분류 성능이 가장 좋은 모델의 판정
-    top = sc[sc["모델"].isin(MODELS[:4])].sort_values("log-loss").iloc[0]
-    best, nv = top["모델"], sc[sc["모델"] == NAIVE].iloc[0]
+# ── 분류 모델 3종 학습·평가
+X = make_features(d)
+cf = run_classifiers(X, task) if len(X) >= 10 and X.paper.nunique() >= 4 else None
+
+if cf is not None:  # 헤드라인
+    csc = cf["scores"]
+    top = csc[csc["모델"].isin(CLF_NAMES)].sort_values("log-loss").iloc[0]
+    base = csc[csc["모델"] == NAIVE].iloc[0]
     with st.container(border=True):
-        st.subheader(f"🏁 분류 성능 1위: {best}")
-        msg = f"{task_name} 기준 log-loss {top['log-loss']:.3f} (다수결 기준선 {nv['log-loss']:.3f}) — "
-        if top["log-loss"] < nv["log-loss"]:
-            st.success(msg + "기준선보다 잘 예측합니다.")
+        st.subheader(f"🏁 분류 모델 3종 중 1위: {top['모델']}")
+        h1, h2, h3 = st.columns(3)
+        h1.metric("AUC", f"{top['AUC']:.2f}", f"{top['AUC'] - base['AUC']:+.2f} vs 기준선")
+        h2.metric("균형정확도", f"{top['균형정확도']:.1%}", f"{top['균형정확도'] - base['균형정확도']:+.1%} vs 기준선")
+        h3.metric("log-loss (낮을수록 좋음)", f"{top['log-loss']:.3f}", f"{top['log-loss'] - base['log-loss']:+.3f} vs 기준선", delta_color="inverse")
+        if top["log-loss"] < base["log-loss"]:
+            st.success("1위 모델이 다수결 기준선보다 잘 분류합니다.")
         else:
-            st.warning(msg + "기준선을 넘지 못했습니다. 이 과제에서는 개별 연구 결과를 예측하는 데 모델이 거의 도움이 되지 않습니다 "
-                             "(개별 연구 대부분이 '불분명'이라 클래스가 한쪽으로 쏠려 있기 때문).")
-        st.caption(f"leave-one-paper-out 평가(공통 {len(ok)}건) 기준 1위 모델이 내린 칸별 최종 판정(합산 추정치의 95% CI 기준)입니다.")
-        icon = {"개선": "🟩 개선", "불분명": "⬜ 불분명", "악화": "🟥 악화", None: "—"}
-        piv = {}
-        for c in cells:
-            piv.setdefault(c["metric"], {})[c["comp"]] = icon[c["cls"][best]]
-        st.dataframe(pd.DataFrame(piv).T[[EDGES["A"][2], EDGES["B"][2]]].reindex(
-            [m for m in METRIC_KO.values() if m in piv]), width="stretch")
+            st.warning("어느 분류 모델도 다수결 기준선을 넘지 못했습니다. 주어진 특징(지표·비교·하위군·연도·SE)만으로는 연구 결과의 클래스를 신뢰성 있게 예측하기 어렵다는 뜻입니다.")
 
-tc, t1, t2, t3 = st.tabs(["⭐ 분류 성능", "① 판정표 한눈에", "② 칸별 자세히", "③ 진단(이질성·일치성)"])
+tc, tm, t1, t2, t3 = st.tabs(["⭐ 분류 모델 3종", "📎 메타분석 모델의 판정 성능", "① 판정표 한눈에", "② 칸별 자세히", "③ 진단(이질성·일치성)"])
 
 with tc:
-    st.subheader("분류 문제 정의")
+    if cf is None:
+        st.info("분류 모델을 학습하기에 데이터가 부족합니다(논문 4편 이상, 10행 이상 필요).")
+    else:
+        cl, cms_, oof_, y_ = cf["classes"], cf["cms"], cf["oof"], cf["y"]
+        st.subheader("분류 문제 정의")
+        st.markdown(
+            "| 항목 | 내용 |\n|---|---|\n"
+            f"| **분류 대상** | 제로음료가 들어간 비교의 연구 결과 {len(X)}건 (논문 {X.paper.nunique()}편) |\n"
+            f"| **클래스** | {' / '.join(cl)} " + ("(MD의 부호)" if task == "dir" else "(그 연구 자신의 95% CI, 0 기준)") + " |\n"
+            "| **입력 특징** | 지표 · 비교(제로 vs 설탕/물) · 하위군(감미료·성별 등) · 발표연도 · 지표 안에서 표준화한 SE 크기 |\n"
+            "| **입력에서 뺀 것** | 효과크기(MD) — 넣으면 정답이 그대로 들어가는 누수 |\n"
+            "| **평가** | leave-one-paper-out: 같은 논문의 행을 통째로 빼고 예측 |\n"
+            f"| **기준선** | {NAIVE}: 학습 데이터에서 가장 흔한 클래스만 예측 |\n"
+            "| **분류 모델 3종** | ① 로지스틱 회귀(해석 쉬움) · ② 랜덤 포레스트(비선형·상호작용) · ③ 그래디언트 부스팅(순차 보정) |")
+        st.caption(f"클래스 분포: " + " / ".join(f"{k} {int((y_ == i).sum())}" for i, k in enumerate(cl)))
+
+        st.subheader("성능 비교")
+        st.dataframe(cf["scores"].set_index("모델").style.format(
+            {"정확도": "{:.1%}", "균형정확도": "{:.1%}", "macro-F1": "{:.2f}", "AUC": "{:.2f}", "log-loss": "{:.3f}", "Brier": "{:.3f}"})
+            .highlight_max(subset=["정확도", "균형정확도", "macro-F1", "AUC"], color="#cde8cd")
+            .highlight_min(subset=["log-loss", "Brier"], color="#cde8cd"), width="stretch")
+        st.caption("정확도·균형정확도·macro-F1·AUC는 높을수록, log-loss·Brier는 낮을수록 좋습니다. AUC 0.5는 무작위 수준입니다. "
+                   "기준선의 AUC가 0.5보다 낮게 나오는 것은 leave-one-paper-out에서 학습 분포가 검증 분포와 반대로 치우치기 때문에 생기는 알려진 현상이니 무시하세요. "
+                   f"행 {len(X)}건·논문 {X.paper.nunique()}편의 작은 표본이라 점수 차이가 작으면 우연일 수 있습니다.")
+        g1, g2 = st.columns(2)
+        with g1:
+            if len(cl) == 2:
+                f = go.Figure()
+                for n, col in zip(CLF_NAMES + [NAIVE], CF_COLOR):
+                    fpr, tpr, _ = roc_curve(y_ == 0, oof_[n][:, 0])
+                    f.add_trace(go.Scatter(x=fpr, y=tpr, mode="lines", name=n, line=dict(color=col, width=3 if n != NAIVE else 1)))
+                f.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", line=dict(dash="dot", color="gray"), showlegend=False))
+                f.update_layout(title=f"ROC 곡선 (양성 = {cl[0]})", height=360, xaxis_title="거짓양성률", yaxis_title="참양성률",
+                                margin=dict(l=10, r=10, t=50, b=10), legend=dict(orientation="h", y=-0.25))
+                st.plotly_chart(f, width="stretch")
+            else:
+                st.info("ROC 곡선은 2클래스 과제에서만 표시합니다.")
+        with g2:
+            sc_ = cf["scores"]
+            f = go.Figure(go.Bar(x=sc_["모델"], y=sc_["균형정확도"], marker_color=CF_COLOR, text=[f"{v:.0%}" for v in sc_["균형정확도"]],
+                                 textposition="outside"))
+            f.update_layout(title="균형정확도", height=360, yaxis=dict(range=[0, 1], tickformat=".0%"),
+                            margin=dict(l=10, r=10, t=50, b=10), xaxis_tickangle=-15)
+            st.plotly_chart(f, width="stretch")
+
+        st.subheader("혼동행렬 (행=실제, 열=예측)")
+        for col, n in zip(st.columns(4), CLF_NAMES + [NAIVE]):
+            f = go.Figure(go.Heatmap(z=cms_[n], x=cl, y=cl, text=cms_[n], texttemplate="%{text}", showscale=False, colorscale="Blues", xgap=2, ygap=2))
+            f.update_yaxes(autorange="reversed")
+            f.update_layout(title=dict(text=n, font=dict(size=13)), height=300, margin=dict(l=10, r=10, t=50, b=10))
+            col.plotly_chart(f, width="stretch")
+
+        st.subheader("모델이 무엇을 보고 판단했나 (특징 중요도)")
+        for col, n, c in zip(st.columns(3), CLF_NAMES, CF_COLOR):
+            im = cf["imps"][n].head(8)[::-1]
+            f = go.Figure(go.Bar(x=im.values, y=im.index, orientation="h", marker_color=c))
+            f.update_layout(title=dict(text=n, font=dict(size=13)), height=330, margin=dict(l=10, r=10, t=50, b=10), xaxis_tickformat=".0%")
+            col.plotly_chart(f, width="stretch")
+        st.caption("로지스틱 회귀는 계수 절댓값, 나머지는 모델 내장 중요도이며 각각 합이 100%가 되게 맞췄습니다. 전체 자료로 다시 적합한 모델 기준입니다.")
+
+        st.subheader(f"지표 × 비교별 '{cl[0]}' 예측 확률 (검증 예측의 평균)")
+        grp = X.assign(**{n: oof_[n][:, 0] for n in CLF_NAMES}, 실제=(y_ == 0).astype(float))
+        grp["칸"] = grp.metric + " · " + grp.edge.map({"A": EDGES["A"][2], "B": EDGES["B"][2]})
+        tbl = grp.groupby("칸")[["실제"] + CLF_NAMES].mean().reindex(
+            [f"{m} · {EDGES[e][2]}" for m in METRIC_KO.values() for e in "AB" if f"{m} · {EDGES[e][2]}" in set(grp["칸"])])
+        f = go.Figure(go.Heatmap(z=tbl.values, x=[f"실제 {cl[0]} 비율"] + CLF_NAMES, y=tbl.index, text=[[f"{v:.0%}" for v in r] for r in tbl.values],
+                                 texttemplate="%{text}", zmin=0, zmax=1, colorscale="Blues", showscale=False, xgap=3, ygap=3))
+        f.update_yaxes(autorange="reversed")
+        f.update_xaxes(side="top")
+        f.update_layout(height=max(380, 36 * len(tbl) + 90), margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(f, width="stretch")
+        st.caption("각 칸에서 모델들이 '" + cl[0] + "' 쪽이라고 본 평균 확률과 실제 비율을 비교합니다. 둘이 비슷하면 모델이 그 칸의 경향을 잡은 것입니다.")
+
+        with st.expander("직접 예측해 보기"):
+            e1, e2, e3, e4 = st.columns(4)
+            q_m = e1.selectbox("지표", [m for m in METRIC_KO.values() if m in set(X.metric)], key="q_m")
+            q_e = e2.radio("비교", ["A", "B"], format_func=lambda e: EDGES[e][2], key="q_e")
+            q_s = e3.selectbox("하위군", sorted(X["sub"].unique()), key="q_s")
+            q_y = e4.slider("발표연도", int(X.year.min()), int(X.year.max()), int(X.year.median()), key="q_y")
+            q_z = st.slider("SE 크기(지표 안 표준화, +면 부정확한 연구)", -2.0, 2.0, 0.0, 0.1, key="q_z")
+            row = pd.DataFrame([dict(metric=q_m, edge=q_e, sub=q_s, year=q_y, log_se_z=q_z)])
+            for col, n in zip(st.columns(3), CLF_NAMES):
+                pr = cf["fitted"][n].predict_proba(row)[0]
+                col.metric(n, f"P({cl[0]}) = {pr[0]:.0%}", f"예측: {cl[int(np.argmax(pr))]}", delta_color="off")
+
+with tm:
+    st.subheader("메타분석 모델은 연구 결과를 얼마나 잘 분류하나")
+    st.caption("앞 탭의 지도학습 분류 모델과 달리, 메타분석 모델(베이스라인·①②③)이 만든 예측분포로 같은 과제를 푼 결과입니다. 정답 연구를 뺀 나머지로 적합합니다(leave-one-paper-out).")
+    ev = loo_eval(d)
+    NAMES = MODELS[:4] + [NAIVE]
+    ev_ok = ev.dropna(subset=[f"{n}|m" for n in MODELS[:4]]) if len(ev) else ev
+    sc = pd.DataFrame()
+    if len(ev_ok) >= 5:
+        sc, cms, ok, classes, tcol = score_models(ev, NAMES, task)
+
+    if len(sc):
+        _top = sc[sc["모델"].isin(MODELS[:4])].sort_values("log-loss").iloc[0]
+        _nv = sc[sc["모델"] == NAIVE].iloc[0]
+        best = _top["모델"]
+        _msg = f"{task_name} 기준 1위 {best}: log-loss {_top['log-loss']:.3f} (다수결 기준선 {_nv['log-loss']:.3f}) — "
+        (st.success if _top["log-loss"] < _nv["log-loss"] else st.warning)(_msg + ("기준선보다 잘 예측합니다." if _top["log-loss"] < _nv["log-loss"] else "기준선을 넘지 못했습니다."))
+    st.subheader("평가 과제")
     if task == "sig":
         st.markdown("**과제**: 연구 한 건이 **개선 / 불분명 / 악화** 중 무엇으로 관측될지 예측합니다. 정답은 그 연구 자신의 95% CI(0 기준)입니다.")
     else:
@@ -401,6 +577,7 @@ with tc:
         st.dataframe(miss[["metric", "study", tcol, "예측", "정답확률"]].rename(columns={"metric": "지표", "study": "연구", tcol: "실제"})
                      .assign(정답확률=lambda x: x["정답확률"].map("{:.1%}".format)), hide_index=True, width="stretch")
         st.caption(f"{best}가 틀린 연구 중 정답 클래스에 가장 낮은 확률을 준 사례입니다. 이상치(예: Peters 2016, Madjd 2017)가 여기에 나타나는지 확인해 보세요.")
+
 
 with t1:
     ylab = [f"{c['metric']} · {c['comp']}" for c in cells]
